@@ -34,7 +34,14 @@
     <div class="result-head">
       <div>
         <h2>{{ result.query.date }} / {{ result.query.ticket_no }}</h2>
-        <p class="weight">净重 <b>{{ result.target.net_weight }}</b> kg；区间 {{ result.query.start }} 至 {{ result.query.end }}（含首尾）。</p>
+        <p class="weight">
+          原报净重 <b>{{ result.original_weight }}</b> kg
+          {% if result.correction_offset_kg %}
+            ；零点纠偏 <b>{{ '%+d'|format(result.correction_offset_kg) }} kg</b>
+            ；纠偏后净重 <b>{{ result.effective_weight }}</b> kg（名次按此重量）
+          {% endif %}
+          ；区间 {{ result.query.start }} 至 {{ result.query.end }}（含首尾）。
+        </p>
       </div>
       {% if result.held %}<span class="badge held big">目标单暂扣中</span>{% else %}<span class="badge ok big">目标单未暂扣</span>{% endif %}
     </div>

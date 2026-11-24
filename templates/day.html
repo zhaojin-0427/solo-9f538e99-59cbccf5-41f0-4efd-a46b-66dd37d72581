@@ -8,6 +8,24 @@
   </div>
   <p class="hint">重报后这里只回读该日期的原始秤单；暂扣标记来自独立暂扣记录。</p>
   {% include "_day_table.html" %}
+
+  <h3>零点纠偏</h3>
+  {% if day_data.correction_offset_kg %}
+  <p class="hint">该日已登记纠偏量 <b>{{ '%+d'|format(day_data.correction_offset_kg) }} kg</b>。填 0 提交即取消，小计会平移回原重量。</p>
+  {% else %}
+  <p class="hint">该日尚未登记纠偏。纠偏量取 -65535～65535 的整数；任一小计叶子纠偏后越界会被拒绝。</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('correction') }}" class="form inline-actions">
+    <input type="hidden" name="date" value="{{ day_data.date }}">
+    <div class="field">
+      <label for="day-corr-offset">纠偏量(kg)</label>
+      <input id="day-corr-offset" name="offset" type="number" min="-65535" max="65535" step="1" required value="{{ day_data.correction_offset_kg or '' }}" placeholder="整数，0 取消">
+    </div>
+    <div class="button-row">
+      <button class="btn primary" type="submit">登记 / 取消纠偏</button>
+    </div>
+  </form>
+
   <p><a class="btn primary" href="{{ url_for('query_view', date=day_data.date, start=day_data.date[:4] ~ '-01-01', end=day_data.date[:4] ~ '-12-31') }}">去查该日单号名次</a></p>
 </section>
 {% endblock %}

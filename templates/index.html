@@ -49,6 +49,48 @@
   </section>
 </div>
 
+<section class="card" id="correction">
+  <h2>地磅零点纠偏登记</h2>
+  <p class="hint">地磅某天零点偏移时，在此选择日期并填写整数纠偏量（<code>-65535</code>～<code>65535</code> 千克）；填 <code>0</code> 取消该日纠偏。每个自然年最多登记一个纠偏日。原报净重照存不动，当天回读同时显示原值与纠偏后净重，两种口径的名次都按纠偏后重量计算。登记校核只读取小计键，不读原单；任一原单纠偏后超出 <code>0～65535</code> 千克会被拒绝。</p>
+  <form action="{{ url_for('correction') }}" method="post" class="form inline-actions">
+    <div class="field">
+      <label for="corr-date">纠偏日期</label>
+      <input id="corr-date" name="date" type="date" required value="{{ request.args.get('date') or today }}">
+    </div>
+    <div class="field">
+      <label for="corr-offset">纠偏量（kg，整数）</label>
+      <input id="corr-offset" name="offset" type="number" min="-65535" max="65535" step="1" required placeholder="例如 120 或 -50；0 取消">
+    </div>
+    <div class="button-row">
+      <button class="btn primary" type="submit">登记 / 取消纠偏</button>
+    </div>
+  </form>
+  {% if corrections %}
+  <h3>已登记的纠偏日</h3>
+  <table class="data compact">
+    <thead><tr><th>纠偏日期</th><th>自然年</th><th>纠偏量(kg)</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for c in corrections %}
+      <tr>
+        <td><a href="{{ url_for('day_view', date=c.slip_date) }}">{{ c.slip_date }}</a></td>
+        <td class="num">{{ c.year }}</td>
+        <td class="num">{{ '%+d'|format(c.offset_kg) }}</td>
+        <td>
+          <form method="post" action="{{ url_for('correction') }}" class="inline">
+            <input type="hidden" name="date" value="{{ c.slip_date }}">
+            <input type="hidden" name="offset" value="0">
+            <button class="btn small" type="submit">取消纠偏(填0)</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">尚未登记任何纠偏日。</p>
+  {% endif %}
+</section>
+
 <section class="card" id="query">
   <h2>同期名次复核</h2>
   <form action="{{ url_for('query_view') }}" method="get" class="form query-form">
@@ -85,6 +127,7 @@
   <ul>
     <li>名次 JSON：<code>GET /api/rank?date=2026-05-01&amp;ticket_no=B&amp;start=2026-01-01&amp;end=2026-12-31</code></li>
     <li>上传：<code>POST /upload</code>，表单字段 <code>date</code> 与文件 <code>file</code>。</li>
+    <li>纠偏登记 / 取消：<code>POST /correction</code>（或 <code>/api/correction</code>），字段 <code>date</code>、<code>offset</code>（整数，-65535～65535，0 取消）。</li>
     <li>暂扣 / 解除：<code>POST /hold</code>、<code>POST /release</code>。</li>
   </ul>
 </section>

@@ -8,6 +8,12 @@
     <dt>单号</dt><dd>{{ ticket_no }}</dd>
     <dt>原单净重</dt>
     <dd>{% if data.ticket %}<b>{{ data.ticket.net_weight }}</b> kg{% else %}<span class="badge warn-text">当前不存在（可能尚未重报或已被整日替换移除）</span>{% endif %}</dd>
+    <dt>零点纠偏</dt>
+    <dd>{% if data.correction_offset_kg %}<b>{{ '%+d'|format(data.correction_offset_kg) }} kg</b>{% else %}无（0）{% endif %}</dd>
+    {% if data.ticket %}
+    <dt>纠偏后净重</dt>
+    <dd><b>{{ data.effective_weight }}</b> kg（名次按此重量计算）</dd>
+    {% endif %}
     <dt>暂扣状态</dt>
     <dd>{% if data.held %}<span class="badge held">暂扣中</span>{% if data.hold.reason %}：{{ data.hold.reason }}{% endif %}{% else %}<span class="badge ok">未暂扣</span>{% endif %}</dd>
   </dl>

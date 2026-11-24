@@ -21,6 +21,10 @@ WEIGHT_MAX = 65535
 WEIGHT_SIZE = 65536  # 2 ** 16
 SUBTOTAL_KEY_LIMIT = 576
 
+# A whole-day zero offset may sit in [-65535, 65535]; 0 means "cancel".
+CORRECTION_MIN = -WEIGHT_MAX
+CORRECTION_MAX = WEIGHT_MAX
+
 SCOPE_ALL = "all"
 SCOPE_ACTIVE = "active"
 
@@ -221,6 +225,16 @@ CREATE TABLE IF NOT EXISTS subtotals (
     PRIMARY KEY (date_key, weight_key, scope)
 ) WITHOUT ROWID;
 
+-- At most one correction day per calendar year. Rows with offset 0 are
+-- deleted (cancellation), so only active corrections are stored.
+CREATE TABLE IF NOT EXISTS corrections (
+    slip_date  TEXT PRIMARY KEY,
+    offset_kg  INTEGER NOT NULL CHECK (offset_kg BETWEEN -65535 AND 65535)
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_year
+    ON corrections(substr(slip_date, 1, 4));
+
 CREATE INDEX IF NOT EXISTS idx_holds_date ON holds(slip_date);
 """
 
@@ -396,6 +410,309 @@ def decode_csv_bytes(raw: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Zero-point corrections
+#
+# tickets.net_weight always keeps the *original* reading. The subtotals table
+# always stores the *effective* weight (original plus the day's registered
+# offset), so rank queries need no special casing. A correction registration
+# therefore only shifts that day's exact-weight leaf counts between weight
+# keys, and every guard is answered from subtotals alone -- the tickets table
+# is never read during registration.
+# ---------------------------------------------------------------------------
+
+
+def parse_correction_offset(value: object) -> int:
+    """Parse the -65535..65535 integer offset; 0 means cancellation."""
+    if value is None:
+        raise ValidationError("纠偏量不能为空")
+    text = str(value).strip().replace(",", "").replace("_", "")
+    if not text:
+        raise ValidationError("纠偏量不能为空")
+    if not (
+        (text[0] in "+-" and text[1:].isdigit()) or text.isdigit()
+    ):
+        raise ValidationError(f"纠偏量必须是整数：{text!r}")
+    offset = int(text)
+    if not CORRECTION_MIN <= offset <= CORRECTION_MAX:
+        raise ValidationError(
+            f"纠偏量 {offset} 超出范围（-65535～65535 千克）"
+        )
+    return offset
+
+
+def day_date_key(day: date) -> str:
+    """Subtotal date key of the single-day leaf segment for ``day``."""
+    seg = next(s for s in date_ancestors(day) if s.hi - s.lo == 1)
+    return seg.key
+
+
+def _parse_weight_leaf_key(weight_key: str) -> Optional[int]:
+    """Return the exact weight of a weight leaf key, else None for wider bands."""
+    if not weight_key.startswith("weight:"):
+        return None
+    body = weight_key[len("weight:") :]
+    lo_text, hi_text = body.split("..", 1)
+    lo = int(lo_text)
+    hi = int(hi_text)
+    if hi != lo:  # leaf keys look like weight:00123..00123
+        return None
+    return lo
+
+
+def read_single_day_leaf_counts(
+    conn: sqlite3.Connection, day_text: str
+) -> dict[tuple[int, str], int]:
+    """Read leaf counts of the single-day date segment only (no ancestors)."""
+    day = parse_iso_date(day_text, "日期")
+    leaf_key = day_date_key(day)
+    rows = conn.execute(
+        """
+        SELECT weight_key, scope, ticket_count
+        FROM subtotals
+        WHERE date_key = ?
+        """,
+        (leaf_key,),
+    ).fetchall()
+    leaves: dict[tuple[int, str], int] = {}
+    for row in rows:
+        weight = _parse_weight_leaf_key(row["weight_key"])
+        if weight is None:
+            continue
+        leaves[(weight, row["scope"])] = int(row["ticket_count"])
+    return leaves
+
+
+def _check_leaf_scope_consistency(
+    leaves: dict[tuple[int, str], int]
+) -> None:
+    """Cross-check the two calibers using only subtotal counts."""
+    for (weight, scope), count in leaves.items():
+        if count < 0:
+            raise sqlite3.IntegrityError(f"小计票数为负：重量 {weight} / {scope}")
+        if scope == SCOPE_ACTIVE:
+            total = leaves.get((weight, SCOPE_ALL), 0)
+            if count > total:
+                raise sqlite3.IntegrityError(
+                    f"未暂扣票数 {count} 超过全部票数 {total}（重量 {weight}）"
+                )
+
+
+def validate_shift_bounds(
+    leaves: dict[tuple[int, str], int], shift: int
+) -> None:
+    """Reject a shift that would move any original ticket outside 0..65535."""
+    if shift == 0:
+        return
+    for (weight, scope), count in leaves.items():
+        if scope != SCOPE_ALL or count <= 0:
+            continue
+        corrected = weight + shift
+        if not WEIGHT_MIN <= corrected <= WEIGHT_MAX:
+            raise ValidationError(
+                f"登记被拒：原单净重 {weight} kg 纠偏 {shift:+d} 后为 "
+                f"{corrected} kg，超出 0～65535 千克范围；该纠偏量未登记。"
+            )
+
+
+def shift_day_subtotals(
+    conn: sqlite3.Connection,
+    day_text: str,
+    leaves: dict[tuple[int, str], int],
+    shift: int,
+) -> None:
+    """Move the day's effective weights by ``shift`` kg on every date ancestor.
+
+    ``leaves`` is the single-day segment's current leaf distribution. The new
+    leaf distribution is derived in memory (weights shifted, colliding weights
+    merged). The difference between the old and new dyadic weight trees is
+    then applied as a delta to every date segment of the day's ancestor
+    chain -- leaves and every wider weight band the rank query reads.
+
+    Applying a *delta* (rather than rewriting whole segments) is essential:
+    ancestor segments also aggregate other days, whose rows must survive.
+    Bounds must have been validated before calling this.
+    """
+    if shift == 0:
+        return
+    day = parse_iso_date(day_text, "日期")
+    date_keys = [seg.key for seg in date_ancestors(day)]
+    active_scopes = {scope for (_, scope), count in leaves.items() if count > 0}
+
+    new_leaves: dict[tuple[int, str], int] = {}
+    for (weight, scope), count in leaves.items():
+        if count <= 0:
+            continue
+        new_key = (weight + shift, scope)
+        new_leaves[new_key] = new_leaves.get(new_key, 0) + count
+
+    # Per-scope delta of dyadic band counts: new tree minus old tree.
+    delta: dict[tuple[str, str], int] = {}
+    for scope in active_scopes:
+        old_bands: dict[str, int] = {}
+        for (weight, s), count in leaves.items():
+            if s != scope:
+                continue
+            for seg in weight_ancestors(weight):
+                old_bands[seg.key] = old_bands.get(seg.key, 0) + count
+        new_bands: dict[str, int] = {}
+        for (weight, s), count in new_leaves.items():
+            if s != scope:
+                continue
+            for seg in weight_ancestors(weight):
+                new_bands[seg.key] = new_bands.get(seg.key, 0) + count
+        for weight_key in set(old_bands) | set(new_bands):
+            amount = new_bands.get(weight_key, 0) - old_bands.get(weight_key, 0)
+            if amount:
+                delta[(weight_key, scope)] = amount
+
+    for date_key in date_keys:
+        for (weight_key, scope), amount in delta.items():
+            if amount > 0:
+                conn.execute(
+                    """
+                    INSERT INTO subtotals(date_key, weight_key, scope, ticket_count)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(date_key, weight_key, scope) DO UPDATE SET
+                        ticket_count = subtotals.ticket_count + excluded.ticket_count
+                    """,
+                    (date_key, weight_key, scope, amount),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE subtotals
+                    SET ticket_count = ticket_count + ?
+                    WHERE date_key = ? AND weight_key = ? AND scope = ?
+                      AND ticket_count + ? >= 0
+                    """,
+                    (amount, date_key, weight_key, scope, amount),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError(
+                        f"缺少或无法扣减小计键：{date_key} / {weight_key} / {scope} / {amount}"
+                    )
+    conn.execute("DELETE FROM subtotals WHERE ticket_count = 0")
+
+
+def get_correction(conn: sqlite3.Connection, day_text: str) -> int:
+    """Return the registered offset for a day (0 when none)."""
+    day = parse_iso_date(day_text, "日期").isoformat()
+    row = conn.execute(
+        "SELECT offset_kg FROM corrections WHERE slip_date = ?",
+        (day,),
+    ).fetchone()
+    return int(row["offset_kg"]) if row is not None else 0
+
+
+def list_corrections(
+    conn: sqlite3.Connection, year: Optional[int] = None
+) -> list[dict[str, object]]:
+    if year is not None:
+        rows = conn.execute(
+            """
+            SELECT slip_date, offset_kg
+            FROM corrections
+            WHERE substr(slip_date, 1, 4) = ?
+            ORDER BY slip_date
+            """,
+            (str(year),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT slip_date, offset_kg FROM corrections ORDER BY slip_date"
+        ).fetchall()
+    return [
+        {
+            "slip_date": row["slip_date"],
+            "year": int(row["slip_date"][:4]),
+            "offset_kg": int(row["offset_kg"]),
+        }
+        for row in rows
+    ]
+
+
+def register_correction(
+    conn: sqlite3.Connection, slip_date: str, offset_value: object
+) -> dict[str, object]:
+    """Register (or cancel with 0) the single correction day of a year.
+
+    The bounds check reads subtotal leaf counts only; the tickets table is
+    never touched here. Everything runs in one write transaction, so any
+    failure leaves the previously committed state intact.
+    """
+    day = parse_iso_date(slip_date, "纠偏日期")
+    day_text = day.isoformat()
+    offset = parse_correction_offset(offset_value)
+
+    with write_transaction(conn):
+        existing = conn.execute(
+            "SELECT offset_kg FROM corrections WHERE slip_date = ?",
+            (day_text,),
+        ).fetchone()
+        old_offset = int(existing["offset_kg"]) if existing is not None else 0
+
+        # One correction day per natural year (the unique expression index is
+        # the hard guarantee; this gives a friendly message).
+        other = conn.execute(
+            """
+            SELECT slip_date, offset_kg
+            FROM corrections
+            WHERE substr(slip_date, 1, 4) = ? AND slip_date <> ?
+            """,
+            (str(day.year), day_text),
+        ).fetchone()
+        if other is not None:
+            raise ValidationError(
+                f"{day.year} 年已登记纠偏日 {other['slip_date']}"
+                f"（纠偏量 {int(other['offset_kg']):+d} kg），"
+                "每个自然年只能设一个纠偏日；请先把该日纠偏量改为 0 取消。"
+            )
+
+        # Only the single-day segment describes this day's own tickets;
+        # ancestor segments aggregate other days too and must never feed the
+        # bounds check or the shift.
+        leaves = read_single_day_leaf_counts(conn, day_text)
+        _check_leaf_scope_consistency(leaves)
+
+        if offset == 0:
+            if old_offset == 0:
+                action = "unchanged"
+                shift = 0
+            else:
+                action = "cancelled"
+                shift = -old_offset
+                validate_shift_bounds(leaves, shift)
+                shift_day_subtotals(conn, day_text, leaves, shift)
+                conn.execute(
+                    "DELETE FROM corrections WHERE slip_date = ?", (day_text,)
+                )
+        else:
+            action = "updated" if existing is not None else "registered"
+            shift = offset - old_offset
+            validate_shift_bounds(leaves, shift)
+            shift_day_subtotals(conn, day_text, leaves, shift)
+            conn.execute(
+                """
+                INSERT INTO corrections(slip_date, offset_kg)
+                VALUES (?, ?)
+                ON CONFLICT(slip_date) DO UPDATE SET
+                    offset_kg = excluded.offset_kg
+                """,
+                (day_text, offset),
+            )
+
+        touched_leaves = sum(1 for (_, scope), c in leaves.items() if scope == SCOPE_ALL and c > 0)
+        return {
+            "date": day_text,
+            "offset_kg": offset,
+            "previous_offset_kg": old_offset,
+            "shift_kg": shift,
+            "action": action,
+            "leaf_weights_checked": touched_leaves,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Aggregate updates
 # ---------------------------------------------------------------------------
 
@@ -485,6 +802,10 @@ def adjust_existing_ticket_active(
 # ---------------------------------------------------------------------------
 
 
+def effective_weight(original_weight: int, offset: int) -> int:
+    return original_weight + offset
+
+
 def replace_day_tickets(
     conn: sqlite3.Connection, slip_date: str, tickets: list[tuple[str, int]]
 ) -> dict[str, int]:
@@ -492,6 +813,28 @@ def replace_day_tickets(
     date_text = day.isoformat()
 
     with write_transaction(conn):
+        offset = get_correction(conn, date_text)
+
+        # Whole-day re-reports keep entering original weights; the registered
+        # correction still applies. One out-of-range corrected ticket rejects
+        # the whole day before any row is rewritten.
+        out_of_range = [
+            (no, weight, weight + offset)
+            for no, weight in tickets
+            if not WEIGHT_MIN <= weight + offset <= WEIGHT_MAX
+        ]
+        if out_of_range:
+            no, original, corrected = out_of_range[0]
+            raise ValidationError(
+                f"整日重报被拒：单号 {no} 原净重 {original} kg 按已登记纠偏量 "
+                f"{offset:+d} 后为 {corrected} kg，超出 0～65535 千克；"
+                "当日旧秤单保持不变。",
+                errors=[
+                    f"单号 {no}：{original} kg 纠偏后 {corrected} kg 越界"
+                    for no, original, corrected in out_of_range
+                ],
+            )
+
         old_rows = conn.execute(
             "SELECT ticket_no, net_weight FROM tickets WHERE slip_date = ?",
             (date_text,),
@@ -504,10 +847,11 @@ def replace_day_tickets(
 
         delta: dict[tuple[str, str, str], int] = {}
         for row in old_rows:
+            # Subtotals hold effective weights: original reading plus offset.
             add_ticket_to_delta(
                 delta,
                 date_text,
-                row["net_weight"],
+                effective_weight(int(row["net_weight"]), offset),
                 held=row["ticket_no"] in held_numbers,
                 sign=-1,
             )
@@ -515,7 +859,7 @@ def replace_day_tickets(
             add_ticket_to_delta(
                 delta,
                 date_text,
-                weight,
+                effective_weight(weight, offset),
                 held=ticket_no in held_numbers,
                 sign=+1,
             )
@@ -531,6 +875,7 @@ def replace_day_tickets(
         "date": date_text,
         "old_count": len(old_rows),
         "new_count": len(tickets),
+        "correction_offset_kg": offset,
         "subtotal_delta_keys": changed_keys,
     }
 
@@ -578,7 +923,13 @@ def hold_ticket(
                 (day, ticket_no, (reason or "").strip() or None),
             )
             if ticket is not None:
-                adjust_existing_ticket_active(conn, day, ticket["net_weight"], -1)
+                offset = get_correction(conn, day)
+                adjust_existing_ticket_active(
+                    conn,
+                    day,
+                    effective_weight(int(ticket["net_weight"]), offset),
+                    -1,
+                )
 
         hold = conn.execute(
             "SELECT slip_date, ticket_no, reason, created_at FROM holds WHERE slip_date=? AND ticket_no=?",
@@ -613,7 +964,13 @@ def release_ticket(conn: sqlite3.Connection, slip_date: str, ticket_no: str) -> 
                 (day, ticket_no),
             )
             if ticket is not None:
-                adjust_existing_ticket_active(conn, day, ticket["net_weight"], +1)
+                offset = get_correction(conn, day)
+                adjust_existing_ticket_active(
+                    conn,
+                    day,
+                    effective_weight(int(ticket["net_weight"]), offset),
+                    +1,
+                )
         else:
             action = "not_held"
 
@@ -626,6 +983,7 @@ def release_ticket(conn: sqlite3.Connection, slip_date: str, ticket_no: str) -> 
 
 def get_day_readback(conn: sqlite3.Connection, slip_date: str) -> dict[str, object]:
     day = parse_iso_date(slip_date, "日期").isoformat()
+    offset = get_correction(conn, day)
     tickets = conn.execute(
         """
         SELECT t.slip_date, t.ticket_no, t.net_weight,
@@ -639,6 +997,12 @@ def get_day_readback(conn: sqlite3.Connection, slip_date: str) -> dict[str, obje
         """,
         (day,),
     ).fetchall()
+    ticket_dicts: list[dict[str, object]] = []
+    for row in tickets:
+        item = dict(row)
+        item["correction_offset_kg"] = offset
+        item["effective_weight"] = int(row["net_weight"]) + offset
+        ticket_dicts.append(item)
     missing_holds = conn.execute(
         """
         SELECT h.slip_date, h.ticket_no, h.reason, h.created_at
@@ -652,7 +1016,8 @@ def get_day_readback(conn: sqlite3.Connection, slip_date: str) -> dict[str, obje
     ).fetchall()
     return {
         "date": day,
-        "tickets": [dict(row) for row in tickets],
+        "correction_offset_kg": offset,
+        "tickets": ticket_dicts,
         "missing_holds": [dict(row) for row in missing_holds],
     }
 
@@ -668,10 +1033,15 @@ def get_ticket_readback(conn: sqlite3.Connection, slip_date: str, ticket_no: str
             "SELECT slip_date, ticket_no, reason, created_at FROM holds WHERE slip_date=? AND ticket_no=?",
             (day, ticket_no),
         ).fetchone()
+        offset = get_correction(conn, day)
+    ticket_dict = dict(ticket) if ticket else None
+    effective = int(ticket_dict["net_weight"]) + offset if ticket_dict is not None else None
     return {
-        "ticket": dict(ticket) if ticket else None,
+        "ticket": ticket_dict,
         "hold": dict(hold) if hold else None,
         "held": hold is not None,
+        "correction_offset_kg": offset,
+        "effective_weight": effective,
     }
 
 
@@ -793,6 +1163,7 @@ def query_rank(
             (target_day.isoformat(), ticket_no),
         ).fetchone()
         held = hold is not None
+        offset = get_correction(conn, target_day.isoformat())
 
         if target is None:
             return {
@@ -804,6 +1175,7 @@ def query_rank(
                     "start": start.isoformat(),
                     "end": end.isoformat(),
                 },
+                "correction_offset_kg": offset,
                 "date_segments": [seg.label for seg in date_segs],
                 "date_segment_count": len(date_segs),
                 "meter": meter.to_dict(),
@@ -814,7 +1186,13 @@ def query_rank(
                 },
             }
 
-        weight = int(target["net_weight"])
+        original_weight = int(target["net_weight"])
+        # Ranks are always computed on corrected (effective) weights.
+        weight = original_weight + offset
+        if not WEIGHT_MIN <= weight <= WEIGHT_MAX:
+            raise sqlite3.IntegrityError(
+                f"目标单纠偏后重量 {weight} 越界；小计状态可能已损坏"
+            )
         greater_weights = weight_greater_cover(weight)
         equal_weight = WeightSeg(weight, weight + 1)
 
@@ -859,8 +1237,13 @@ def query_rank(
             "ticket_no": ticket_no,
             "start": start.isoformat(),
             "end": end.isoformat(),
+            "original_weight": original_weight,
+            "correction_offset_kg": offset,
             "weight": weight,
         },
+        "correction_offset_kg": offset,
+        "original_weight": original_weight,
+        "effective_weight": weight,
         "date_segments": [seg.label for seg in date_segs],
         "date_segment_count": len(date_segs),
         "weight_greater_key_count": len(greater_weights),

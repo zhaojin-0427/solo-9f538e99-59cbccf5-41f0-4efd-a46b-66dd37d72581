@@ -91,10 +91,12 @@ def create_app(db_path: str | None = None) -> Flask:
                 day_data = core.get_day_readback(get_db(), day)
             except core.ValidationError as exc:
                 flash(exc.message, "error")
+        corrections = core.list_corrections(get_db())
         return render_template(
             "index.html",
             today=core.date.today().isoformat(),
             day_data=day_data,
+            corrections=corrections,
         )
 
     @app.get("/day")
@@ -148,9 +150,15 @@ def create_app(db_path: str | None = None) -> Flask:
         if wants_json():
             return jsonify(ok=True, **summary, filename=filename)
 
+        offset_note = ""
+        if summary.get("correction_offset_kg"):
+            offset_note = (
+                f"当天已登记纠偏量 {summary['correction_offset_kg']:+d} kg，"
+                "小计按纠偏后重量更新；"
+            )
         flash(
             f"已整日替换 {summary['date']}：旧 {summary['old_count']} 单，"
-            f"新 {summary['new_count']} 单；暂扣记录保持有效。",
+            f"新 {summary['new_count']} 单；{offset_note}暂扣记录保持有效。",
             "success",
         )
         return redirect(url_for("day_view", date=summary["date"], uploaded=1), code=303)
@@ -197,6 +205,39 @@ def create_app(db_path: str | None = None) -> Flask:
         else:
             flash("已解除暂扣，未暂扣口径小计已同步恢复。", "success")
         return redirect(url_for("ticket_view", date=day, ticket_no=ticket_no), code=303)
+
+    @app.post("/correction")
+    def correction():
+        day = first_value("date", "slip_date", "slipDate", "correction_date", "day")
+        offset_raw = first_value("offset", "offset_kg", "correction", "delta")
+        try:
+            result = core.register_correction(get_db(), day, offset_raw)
+        except core.ValidationError as exc:
+            return error_response(exc.message, errors=exc.errors)
+        except sqlite3.Error as exc:  # pragma: no cover
+            app.logger.exception("database failure during correction")
+            return error_response(f"纠偏登记失败，已回滚，原状态保持不变：{exc}", status=500)
+
+        if wants_json():
+            return jsonify(ok=True, **result)
+
+        action = result["action"]
+        if action == "cancelled":
+            flash(
+                f"已取消 {result['date']} 的纠偏（原纠偏量 "
+                f"{result['previous_offset_kg']:+d} kg），小计已平移回原重量。",
+                "success",
+            )
+        elif action == "unchanged":
+            flash(f"{result['date']} 本就没有登记纠偏，0 表示取消，状态未变。", "info")
+        else:
+            verb = "更新" if action == "updated" else "登记"
+            flash(
+                f"已{verb} {result['date']} 的零点纠偏：纠偏量 {result['offset_kg']:+d} kg；"
+                f"原报净重保持不变，名次按纠偏后重量计算。",
+                "success",
+            )
+        return redirect(url_for("day_view", date=result["date"]), code=303)
 
     def perform_query():
         day = first_value("date", "slip_date", "slipDate", "ticket_date", "qdate")
@@ -250,11 +291,20 @@ def create_app(db_path: str | None = None) -> Flask:
     def api_release_alias():
         return release()
 
+    @app.post("/api/correction")
+    def api_correction_alias():
+        return correction()
+
     @app.errorhandler(404)
     def not_found(_):
         if wants_json():
             return jsonify(ok=False, error="not found"), 404
-        return render_template("index.html", today=core.date.today().isoformat(), day_data=None), 404
+        return render_template(
+            "index.html",
+            today=core.date.today().isoformat(),
+            day_data=None,
+            corrections=core.list_corrections(get_db()),
+        ), 404
 
     return app
 
